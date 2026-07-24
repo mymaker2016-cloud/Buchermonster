@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 import httpx
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler,
@@ -30,6 +30,15 @@ groq   = Groq(api_key=GROQ_KEY)
 (WAIT_CONTINUE, WAIT_BOOK_TITLE, WAIT_PAGES, WAIT_PHOTOS, WAIT_AUDIO) = range(5)
 sessions: dict[int, dict] = {}
 
+MIN_PAGES_PER_SESSION = 30  # минимум страниц за одну сдачу
+
+def count_pages(pages: str) -> int:
+    """Считает кол-во страниц из строки '10-40' → 30, '12' → 1."""
+    m = re.match(r"^(\d+)[\-–](\d+)$", pages)
+    if m:
+        return abs(int(m.group(2)) - int(m.group(1))) + 1
+    return 1
+
 # ══════════════════════════════════════════════════════════════════
 #  DB
 # ══════════════════════════════════════════════════════════════════
@@ -44,17 +53,19 @@ def db():
         ts DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (chat_id, book, pages))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS last_book (
-        chat_id INTEGER PRIMARY KEY, book TEXT, pages TEXT)""")
+        chat_id INTEGER PRIMARY KEY, book TEXT, pages TEXT,
+        book_text TEXT DEFAULT '', source TEXT DEFAULT '')""")
     conn.commit()
     return conn
 
 def get_last(chat_id):
-    r = db().execute("SELECT book, pages FROM last_book WHERE chat_id=?", (chat_id,)).fetchone()
-    return {"book": r[0], "pages": r[1]} if r else None
+    r = db().execute("SELECT book, pages, book_text, source FROM last_book WHERE chat_id=?", (chat_id,)).fetchone()
+    return {"book": r[0], "pages": r[1], "book_text": r[2] or "", "source": r[3] or ""} if r else None
 
-def save_last(chat_id, book, pages):
+def save_last(chat_id, book, pages, book_text="", source=""):
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO last_book VALUES (?,?,?)", (chat_id, book, pages))
+        c.execute("INSERT OR REPLACE INTO last_book VALUES (?,?,?,?,?)",
+                  (chat_id, book, pages, book_text, source))
 
 def already_passed(chat_id, book, pages):
     r = db().execute(
@@ -323,7 +334,14 @@ async def handle_continue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     cid = update.effective_chat.id
     if "Продолжаю" in update.message.text:
         last = sessions[cid].get("last", {})
-        sessions[cid] = {"photos": [], "book": last["book"], "book_text": "", "source": ""}
+        # Сохраняем book_text из прошлой сессии — не ищем повторно
+        sessions[cid] = {
+            "photos": [],
+            "book": last["book"],
+            "book_text": last.get("book_text", ""),   # пустая → значит в прошлый раз не нашли
+            "source": last.get("source", ""),
+            "skip_search": True,                       # флаг: не искать онлайн повторно
+        }
         await update.message.reply_text(
             f"📖 *«{last['book']}»*\n\nНапиши *страницы* которые читал сегодня:",
             parse_mode="Markdown", reply_markup=kb_cancel())
@@ -354,11 +372,40 @@ async def recv_pages(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             f"🚫 Страницы *{pages}* ты уже сдавал!\nНапиши *другие страницы*.",
             parse_mode="Markdown")
         return WAIT_PAGES
+    # ── Проверка минимума страниц ─────────────────────────────────
+    n_pages = count_pages(pages)
+    if n_pages < MIN_PAGES_PER_SESSION:
+        await update.message.reply_text(
+            f"📏 Маловато! Минимум *{MIN_PAGES_PER_SESSION} страниц* за одну сдачу.\n"
+            f"Ты указал только *{n_pages}* стр.\n\n"
+            "Напиши больший диапазон, например *10-40*",
+            parse_mode="Markdown")
+        return WAIT_PAGES
+
     sessions[cid]["pages"] = pages
 
-    # ── Поиск книги онлайн ───────────────────────────────────────
-    await update.message.reply_text(
-        "🔍 Ищу книгу онлайн...", reply_markup=kb_none())
+    # ── Поиск книги онлайн (пропускаем если продолжаем и уже знаем результат) ──
+    skip_search = sessions[cid].get("skip_search", False)
+
+    if skip_search:
+        # Книга уже была проверена в прошлый раз
+        if sessions[cid].get("book_text"):
+            # Текст книги был найден — сразу к аудио
+            await update.message.reply_text(
+                "🎙 Запиши *голосовое сообщение* — расскажи своими словами что прочитал.",
+                parse_mode="Markdown", reply_markup=kb_none())
+            return WAIT_AUDIO
+        else:
+            # В прошлый раз не нашли — сразу просим фото
+            sessions[cid]["photos"] = []
+            await update.message.reply_text(
+                "📷 Сфотографируй страницы *{pages}* и отправь фото сюда.\n"
+                "Когда отправишь все — нажми кнопку 👇")
+            await update.message.reply_text("Отправляй фото:", reply_markup=kb_photo())
+            return WAIT_PHOTOS
+
+    # Новая книга — ищем онлайн
+    await update.message.reply_text("🔍 Ищу книгу онлайн...", reply_markup=kb_none())
     try:
         result = search_book_text(book, pages)
     except Exception as e:
@@ -440,7 +487,7 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         summary  = result.get("summary", "")
 
         save_result(cid, book, pages, passed, score)
-        save_last(cid, book, pages)
+        save_last(cid, book, pages, session.get("book_text", ""), session.get("source", ""))
 
         if passed:
             child_msg = f"🎉 *Отлично! Молодец!*\n\n💬 {feedback}\n\n⭐ *{score}/100*"
@@ -502,7 +549,16 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("history", cmd_history))
-    logger.info("Bot v6 started.")
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            BotCommand("start",   "▶️ Начать проверку чтения"),
+            BotCommand("history", "📊 История чтения"),
+            BotCommand("cancel",  "❌ Отменить"),
+        ])
+    app.post_init = post_init
+
+    logger.info("Bot v7 started.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
