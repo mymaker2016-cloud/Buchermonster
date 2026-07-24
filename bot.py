@@ -289,6 +289,8 @@ def verify_photos_with_claude(photos_b64: list[str], declared_pages: str, book: 
         messages=[{"role": "user", "content": content}]
     )
     return _parse_json(resp.content[0].text)
+
+async def dl_voice(bot, file_id) -> bytes:
     f = await bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as t:
         await f.download_to_drive(t.name); p = t.name
