@@ -1,32 +1,27 @@
 import os
 import re
 import json
+import sqlite3
 import logging
 import base64
 import tempfile
+import urllib.parse
 from pathlib import Path
 
+import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, ConversationHandler,
 )
-
 import anthropic
 from groq import Groq
 
 # ─── Logging ────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Env vars ───────────────────────────────────────────────────────────────
+# ─── Env ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GROQ_KEY       = os.environ["GROQ_API_KEY"]
@@ -36,21 +31,102 @@ PARENT_CHAT_ID = int(os.environ["PARENT_CHAT_ID"])
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 groq   = Groq(api_key=GROQ_KEY)
 
-# ─── Conversation states ─────────────────────────────────────────────────────
-(
-    WAIT_BOOK_TITLE,
-    WAIT_PAGES,
-    WAIT_PHOTOS,
-    WAIT_AUDIO,
-) = range(4)
+# ─── States ─────────────────────────────────────────────────────────────────
+(WAIT_CONTINUE, WAIT_BOOK_TITLE, WAIT_PAGES, WAIT_PHOTOS, WAIT_AUDIO) = range(5)
 
 # ─── Sessions ────────────────────────────────────────────────────────────────
 sessions: dict[int, dict] = {}
 
-# ─── Keyboards ───────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ════════════════════════════════════════════════════════════════════════════
+
+DB_PATH = "/app/reading_progress.db"
+
+def db_connect():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS progress (
+            chat_id     INTEGER NOT NULL,
+            book_title  TEXT NOT NULL,
+            pages       TEXT NOT NULL,
+            passed      INTEGER NOT NULL DEFAULT 0,
+            score       INTEGER NOT NULL DEFAULT 0,
+            ts          DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (chat_id, book_title, pages)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS last_book (
+            chat_id    INTEGER PRIMARY KEY,
+            book_title TEXT NOT NULL,
+            last_pages TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def db_get_last_book(chat_id: int) -> dict | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT book_title, last_pages FROM last_book WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    return {"title": row[0], "pages": row[1]} if row else None
+
+
+def db_save_last_book(chat_id: int, title: str, pages: str):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO last_book (chat_id, book_title, last_pages) VALUES (?,?,?)",
+            (chat_id, title, pages)
+        )
+        conn.commit()
+
+
+def db_pages_already_done(chat_id: int, title: str, pages: str) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT passed FROM progress WHERE chat_id=? AND book_title=? AND pages=?",
+            (chat_id, title.lower().strip(), pages.strip())
+        ).fetchone()
+    return bool(row and row[0] == 1)
+
+
+def db_save_result(chat_id: int, title: str, pages: str, passed: bool, score: int):
+    with db_connect() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO progress (chat_id, book_title, pages, passed, score)
+               VALUES (?,?,?,?,?)""",
+            (chat_id, title.lower().strip(), pages.strip(), 1 if passed else 0, score)
+        )
+        conn.commit()
+
+
+def db_get_history(chat_id: int) -> list[dict]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """SELECT book_title, pages, passed, score, ts
+               FROM progress WHERE chat_id=? ORDER BY ts DESC LIMIT 10""",
+            (chat_id,)
+        ).fetchall()
+    return [{"title": r[0], "pages": r[1], "passed": r[2], "score": r[3], "ts": r[4]} for r in rows]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  KEYBOARDS
+# ════════════════════════════════════════════════════════════════════════════
+
+def kb_continue(title: str):
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(f'📖 Продолжаю «{title[:30]}»'), KeyboardButton("📚 Другая книга")]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
 def kb_send_photo():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📷 Я отправил все фото")]],
+        [[KeyboardButton("📷 Все фото отправил")]],
         resize_keyboard=True, one_time_keyboard=True,
     )
 
@@ -64,208 +140,187 @@ def kb_remove():
     return ReplyKeyboardRemove()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  BOOK SEARCH  (без web_search — прямые запросы к библиотекам)
+# ════════════════════════════════════════════════════════════════════════════
 
-async def download_photo_base64(bot, file_id: str) -> str:
-    file = await bot.get_file(file_id)
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
-    with open(tmp_path, "rb") as f:
-        data = base64.standard_b64encode(f.read()).decode("utf-8")
-    Path(tmp_path).unlink(missing_ok=True)
-    return data
+SEARCH_TIMEOUT = 10  # секунд на каждый запрос
 
-
-async def download_voice_bytes(bot, file_id: str) -> bytes:
-    file = await bot.get_file(file_id)
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
-    with open(tmp_path, "rb") as f:
-        data = f.read()
-    Path(tmp_path).unlink(missing_ok=True)
-    return data
+def _fetch(url: str) -> str:
+    """Загрузить страницу, вернуть текст или ''."""
+    try:
+        r = httpx.get(url, timeout=SEARCH_TIMEOUT,
+                      headers={"User-Agent": "Mozilla/5.0 (compatible; ReadingBot/1.0)"})
+        if r.status_code == 200:
+            return r.text[:8000]
+    except Exception as e:
+        logger.warning("fetch %s: %s", url, e)
+    return ""
 
 
 def search_book_online(title: str, pages: str) -> dict:
     """
-    Agentic loop: Claude uses web_search tool to find book text.
-    Returns {"found": bool, "text": str, "source": str}
+    Пытается найти текст книги через Wikisource и Google Books.
+    Возвращает {"found": bool, "text": str, "source": str}
     """
-    messages = [{
-        "role": "user",
-        "content": (
-            f"Найди текст книги «{title}» страницы {pages} в открытых источниках. "
-            "Попробуй Lib.ru, Wikisource, Royallib, Litres (бесплатный фрагмент). "
-            "Если нашёл текст — верни ТОЛЬКО JSON:\n"
-            '{"found": true, "text": "точный текст страниц", "source": "сайт"}\n'
-            "Если не нашёл — верни ТОЛЬКО:\n"
-            '{"found": false, "text": "", "source": ""}\n'
-            "Никакого markdown, только чистый JSON."
-        )
-    }]
+    encoded = urllib.parse.quote(title)
 
-    tools = [{"type": "web_search_20250305", "name": "web_search"}]
+    # 1. Wikisource (русский)
+    ws_url = f"https://ru.wikisource.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+    html = _fetch(ws_url)
+    if html and len(html) > 500:
+        # Извлечь чистый текст через Claude (быстро — без поиска)
+        text = _extract_text_from_html(html, title, pages, "Wikisource")
+        if text:
+            return {"found": True, "text": text, "source": "Wikisource"}
 
-    # Agentic loop — max 5 iterations to avoid infinite hang
-    for iteration in range(5):
-        response = claude.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2048,
-            tools=tools,
-            messages=messages,
-        )
-
-        logger.info("Search iteration %d, stop_reason: %s", iteration, response.stop_reason)
-
-        # Add assistant response to history
-        messages.append({"role": "assistant", "content": response.content})
-
-        # If Claude is done — extract JSON from text blocks
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if hasattr(block, "text") and block.text.strip():
-                    raw = block.text.strip()
-                    # Strip markdown fences
-                    if "```" in raw:
-                        parts = raw.split("```")
-                        for part in parts:
-                            part = part.strip()
-                            if part.startswith("json"):
-                                part = part[4:].strip()
-                            if part.startswith("{"):
-                                raw = part
-                                break
-                    try:
-                        result = json.loads(raw)
-                        return result
-                    except Exception:
-                        # Try to find JSON inside the text
-                        match = re.search(r'\{.*\}', raw, re.DOTALL)
-                        if match:
-                            try:
-                                return json.loads(match.group())
-                            except Exception:
-                                pass
-            # No valid JSON found
-            return {"found": False, "text": "", "source": ""}
-
-        # If Claude wants to use tools — process tool calls and continue
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    # web_search results come back automatically in next turn
-                    # We need to add tool_result blocks
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": "Search completed, please analyze the results and provide the JSON response.",
-                    })
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
-            continue
-
-        # Any other stop reason — bail out
-        break
+    # 2. Lib.ru поиск
+    lib_url = f"http://lib.ru/cgi-bin/seek_doc.cgi?term={encoded}&sort=1"
+    html = _fetch(lib_url)
+    if html and "href" in html:
+        # Найти первую ссылку на текст
+        match = re.search(r'href="(/\w+/\w+\.txt)"', html)
+        if match:
+            txt_url = "http://lib.ru" + match.group(1)
+            content = _fetch(txt_url)
+            if content and len(content) > 300:
+                text = _extract_text_from_html(content, title, pages, "Lib.ru")
+                if text:
+                    return {"found": True, "text": text, "source": "Lib.ru"}
 
     return {"found": False, "text": "", "source": ""}
 
 
-def extract_text_from_images(photo_b64_list: list[str], pages: str) -> str:
-    content = []
-    for b64 in photo_b64_list:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-        })
-    content.append({
-        "type": "text",
-        "text": (
-            f"Это фотографии страниц книги (страницы {pages}).\n"
-            "Перепиши точно весь текст с этих страниц — сохрани порядок, абзацы и пунктуацию. "
-            "Не добавляй ничего от себя."
-        ),
-    })
-    response = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": content}],
+def _extract_text_from_html(html: str, title: str, pages: str, source: str) -> str:
+    """Claude извлекает нужные страницы из HTML/текста (быстро, без поиска)."""
+    prompt = (
+        f"Из текста ниже извлеки содержимое страниц {pages} книги «{title}».\n"
+        f"Если страниц нет или текст не соответствует книге — ответь словом: НЕТ\n"
+        f"Иначе — верни только текст страниц без пояснений.\n\n"
+        f"ТЕКСТ:\n{html[:4000]}"
     )
-    return response.content[0].text
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = resp.content[0].text.strip()
+        if result == "НЕТ" or len(result) < 50:
+            return ""
+        return result
+    except Exception as e:
+        logger.error("extract_text error: %s", e)
+        return ""
 
 
-def transcribe_audio(audio_bytes: bytes) -> str:
+# ════════════════════════════════════════════════════════════════════════════
+#  OTHER HELPERS
+# ════════════════════════════════════════════════════════════════════════════
+
+async def download_photo_b64(bot, file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        path = tmp.name
+    with open(path, "rb") as f:
+        data = base64.standard_b64encode(f.read()).decode()
+    Path(path).unlink(missing_ok=True)
+    return data
+
+
+async def download_voice(bot, file_id: str) -> bytes:
+    file = await bot.get_file(file_id)
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        path = tmp.name
+    with open(path, "rb") as f:
+        data = f.read()
+    Path(path).unlink(missing_ok=True)
+    return data
+
+
+def transcribe(audio_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         tmp.write(audio_bytes)
-        tmp_path = tmp.name
+        path = tmp.name
     try:
-        with open(tmp_path, "rb") as f:
+        with open(path, "rb") as f:
             result = groq.audio.transcriptions.create(
                 file=("audio.ogg", f, "audio/ogg"),
-                model="whisper-large-v3",
-                language="ru",
-                response_format="text",
+                model="whisper-large-v3", language="ru", response_format="text",
             )
         return result.strip()
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        Path(path).unlink(missing_ok=True)
+
+
+def ocr_images(photos_b64: list[str], pages: str) -> str:
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+        for b in photos_b64
+    ]
+    content.append({"type": "text", "text":
+        f"Это фото страниц {pages} книги. Перепиши точно весь текст, сохрани порядок и пунктуацию."
+    })
+    resp = claude.messages.create(model="claude-opus-4-5", max_tokens=4096,
+                                   messages=[{"role": "user", "content": content}])
+    return resp.content[0].text
 
 
 def check_comprehension(book_text: str, retelling: str, pages: str, title: str) -> dict:
     prompt = f"""Ты добрый учитель начальной школы.
 
 КНИГА: «{title}», страницы {pages}
-
-ТЕКСТ:
-\"\"\"
-{book_text[:3000]}
-\"\"\"
-
-ПЕРЕСКАЗ РЕБЁНКА:
-\"\"\"
-{retelling}
-\"\"\"
+ТЕКСТ: \"\"\"{book_text[:3000]}\"\"\"
+ПЕРЕСКАЗ: \"\"\"{retelling}\"\"\"
 
 Оцени: главные события, смысл, детали.
-Ответь ТОЛЬКО JSON без markdown:
+Ответь ТОЛЬКО чистым JSON без markdown:
 {{"passed": true/false, "score": 0-100, "feedback": "для ребёнка (дружелюбно)", "summary": "для родителя (2-3 предложения)"}}"""
 
-    response = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = response.content[0].text.strip()
+    resp = claude.messages.create(model="claude-opus-4-5", max_tokens=1024,
+                                   messages=[{"role": "user", "content": prompt}])
+    raw = resp.content[0].text.strip()
     if "```" in raw:
-        parts = raw.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                part = part[4:].strip()
+        for part in raw.split("```"):
+            part = part.strip().lstrip("json").strip()
             if part.startswith("{"):
                 raw = part
                 break
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return json.loads(raw)
+    m = re.search(r'\{.*\}', raw, re.DOTALL)
+    return json.loads(m.group() if m else raw)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 #  HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
-    sessions[chat_id] = {"photos": [], "pages": "", "book_title": "", "book_text": "", "book_source": ""}
     name = update.effective_user.first_name or "друг"
+    sessions[chat_id] = {}
+
+    last = db_get_last_book(chat_id)
+    if last:
+        history = db_get_history(chat_id)
+        done_pages = [h["pages"] for h in history if h["title"] == last["title"].lower().strip() and h["passed"]]
+        done_str = ", ".join(done_pages) if done_pages else "нет"
+        await update.message.reply_text(
+            f"📚 Привет, {name}!\n\n"
+            f"В прошлый раз ты читал *«{last['title']}»*\n"
+            f"Последние страницы: *{last['pages']}*\n"
+            f"Уже сдал: {done_str}\n\n"
+            f"Продолжаем или другая книга?",
+            parse_mode="Markdown",
+            reply_markup=kb_continue(last["title"]),
+        )
+        sessions[chat_id]["last_book"] = last
+        return WAIT_CONTINUE
+
     await update.message.reply_text(
         f"📚 Привет, {name}! Давай проверим чтение.\n\n"
-        "Шаг 1️⃣: Напиши *название книги*, которую ты читаешь.\n\n"
+        "Напиши *название книги* которую ты читаешь.\n"
         "_Например: Гарри Поттер и философский камень_",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
@@ -273,15 +328,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAIT_BOOK_TITLE
 
 
-async def receive_book_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    text = update.message.text
+
+    if "Продолжаю" in text:
+        last = sessions[chat_id].get("last_book", {})
+        sessions[chat_id]["book_title"]  = last["title"]
+        sessions[chat_id]["book_text"]   = ""
+        sessions[chat_id]["book_source"] = ""
+        sessions[chat_id]["photos"]      = []
+        await update.message.reply_text(
+            f"📖 *«{last['title']}»*\n\n"
+            "Напиши *страницы* которые ты читал сегодня.\n"
+            "_Например: 141-155_",
+            parse_mode="Markdown",
+            reply_markup=kb_cancel(),
+        )
+        return WAIT_PAGES
+
+    if "Другая книга" in text or "❌" in text:
+        sessions[chat_id] = {"photos": []}
+        await update.message.reply_text(
+            "Напиши *название новой книги*:",
+            parse_mode="Markdown",
+            reply_markup=kb_cancel(),
+        )
+        return WAIT_BOOK_TITLE
+
+    return WAIT_CONTINUE
+
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
     chat_id = update.effective_chat.id
     title = update.message.text.strip()
-    sessions[chat_id]["book_title"] = title
+    sessions[chat_id] = {"book_title": title, "photos": [], "book_text": "", "book_source": ""}
     await update.message.reply_text(
-        f"📖 «{title}»\n\n"
-        "Шаг 2️⃣: Напиши *страницы* которые ты читал.\n"
+        f"📖 *«{title}»*\n\n"
+        "Напиши *страницы* которые ты читал.\n"
         "_Например: 5-10 или 12_",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
@@ -294,25 +380,32 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await cancel(update, context)
 
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
+    pages = update.message.text.strip()
 
-    if not re.match(r"^\d+[\-–]\d+$|^\d+$", text):
+    if not re.match(r"^\d+[\-–]\d+$|^\d+$", pages):
+        await update.message.reply_text("❗ Напиши страницы в формате *5-10* или *12*", parse_mode="Markdown")
+        return WAIT_PAGES
+
+    title = sessions[chat_id].get("book_title", "")
+
+    # Блокировка повтора
+    if db_pages_already_done(chat_id, title, pages):
         await update.message.reply_text(
-            "❗ Напиши номера страниц в формате *5-10* или *12*",
+            f"🚫 Страницы *{pages}* книги «{title}» ты уже сдавал!\n\n"
+            "Напиши *другие страницы* которые ты читал.",
             parse_mode="Markdown",
         )
         return WAIT_PAGES
 
-    sessions[chat_id]["pages"] = text
-    title = sessions[chat_id]["book_title"]
+    sessions[chat_id]["pages"] = pages
 
+    # Поиск книги онлайн (быстрый, без зависания)
     search_msg = await update.message.reply_text(
-        "🔍 Ищу книгу в интернете... (до 30 сек)",
-        reply_markup=kb_remove(),
+        "🔍 Ищу книгу онлайн...", reply_markup=kb_remove()
     )
 
     try:
-        result = search_book_online(title, text)
+        result = search_book_online(title, pages)
     except Exception as e:
         logger.error("Search error: %s", e)
         result = {"found": False, "text": "", "source": ""}
@@ -321,63 +414,47 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         sessions[chat_id]["book_text"]   = result["text"]
         sessions[chat_id]["book_source"] = result.get("source", "интернет")
         await search_msg.edit_text(
-            f"✅ Нашёл книгу онлайн!\n\n"
-            "Шаг 3️⃣: Запиши *голосовое сообщение* — "
-            "расскажи своими словами что ты прочитал.\n\n"
-            "🎙 Нажми микрофон в Telegram и говори!",
+            f"✅ Нашёл книгу ({result['source']})!\n\n"
+            "🎙 Запиши *голосовое сообщение* — расскажи своими словами что прочитал.",
             parse_mode="Markdown",
         )
         return WAIT_AUDIO
     else:
         await search_msg.edit_text(
-            "😕 Не нашёл книгу онлайн.\n\n"
-            "Шаг 3️⃣: Сфотографируй страницы книги и отправь сюда.\n"
-            "Можно несколько фото подряд.\n"
-            "Когда отправишь все — нажми кнопку 👇",
+            "😕 Не нашёл онлайн.\n\n"
+            "📷 Сфотографируй страницы книги и отправь фото сюда.\n"
+            "Когда отправишь все — нажми кнопку 👇"
         )
-        await update.message.reply_text("Отправляй фото 📷", reply_markup=kb_send_photo())
+        await update.message.reply_text("Отправляй фото:", reply_markup=kb_send_photo())
         return WAIT_PHOTOS
 
 
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     if chat_id not in sessions:
-        await update.message.reply_text("Напиши /start чтобы начать заново.")
+        await update.message.reply_text("Напиши /start")
         return ConversationHandler.END
-
-    photo = update.message.photo[-1]
-    b64 = await download_photo_base64(context.bot, photo.file_id)
+    b64 = await download_photo_b64(context.bot, update.message.photo[-1].file_id)
     sessions[chat_id]["photos"].append(b64)
     count = len(sessions[chat_id]["photos"])
-
-    await update.message.reply_text(
-        f"✅ Фото {count} получено! Отправь ещё или нажми кнопку.",
-        reply_markup=kb_send_photo(),
-    )
+    await update.message.reply_text(f"✅ Фото {count} получено! Ещё или нажми кнопку.", reply_markup=kb_send_photo())
     return WAIT_PHOTOS
 
 
 async def photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message.text == "❌ Отмена":
         return await cancel(update, context)
-
     chat_id = update.effective_chat.id
     session = sessions.get(chat_id, {})
-
     if not session.get("photos"):
         await update.message.reply_text("❗ Сначала отправь хотя бы одно фото.", reply_markup=kb_send_photo())
         return WAIT_PHOTOS
-
     await update.message.reply_text("⏳ Читаю текст с фото...", reply_markup=kb_remove())
-    book_text = extract_text_from_images(session["photos"], session["pages"])
-    sessions[chat_id]["book_text"]   = book_text
+    text = ocr_images(session["photos"], session["pages"])
+    sessions[chat_id]["book_text"]   = text
     sessions[chat_id]["book_source"] = "фото"
-
     await update.message.reply_text(
-        "✅ Готово!\n\n"
-        "Шаг 4️⃣: Запиши *голосовое сообщение* — "
-        "расскажи своими словами что ты прочитал.\n\n"
-        "🎙 Нажми микрофон в Telegram и говори!",
+        "✅ Готово!\n\n🎙 Запиши *голосовое сообщение* — расскажи что прочитал.",
         parse_mode="Markdown",
     )
     return WAIT_AUDIO
@@ -386,31 +463,34 @@ async def photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     session = sessions.get(chat_id)
-
     if not session or not session.get("book_text"):
         await update.message.reply_text("❗ Что-то пошло не так. Напиши /start")
         return ConversationHandler.END
 
     await update.message.reply_text("⏳ Слушаю...", reply_markup=kb_remove())
-
     try:
-        voice_bytes = await download_voice_bytes(context.bot, update.message.voice.file_id)
+        voice = await download_voice(context.bot, update.message.voice.file_id)
         await update.message.reply_text("🔤 Распознаю речь...")
-        retelling = transcribe_audio(voice_bytes)
-        logger.info("Transcription: %s", retelling)
+        retelling = transcribe(voice)
+        logger.info("Retelling: %s", retelling)
 
         await update.message.reply_text("🧠 Проверяю понимание...")
-        result = check_comprehension(
-            session["book_text"], retelling, session["pages"], session["book_title"]
-        )
+        title  = session["book_title"]
+        pages  = session["pages"]
+        result = check_comprehension(session["book_text"], retelling, pages, title)
 
         passed   = result.get("passed", False)
         score    = result.get("score", 0)
         feedback = result.get("feedback", "")
         summary  = result.get("summary", "")
 
+        # Сохранить результат и последнюю книгу
+        db_save_result(chat_id, title, pages, passed, score)
+        db_save_last_book(chat_id, title, pages)
+
+        # Ответ ребёнку
         if passed:
-            child_msg = f"🎉 *Отлично! Ты справился!*\n\n💬 {feedback}\n\n⭐ Результат: *{score}/100*"
+            child_msg = f"🎉 *Отлично! Молодец!*\n\n💬 {feedback}\n\n⭐ Результат: *{score}/100*"
         else:
             child_msg = (
                 f"🤔 *Почти! Попробуй ещё раз.*\n\n💬 {feedback}\n\n"
@@ -418,23 +498,25 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
         await update.message.reply_text(child_msg, parse_mode="Markdown")
 
-        child_name   = update.effective_user.first_name or "Ребёнок"
-        status_emoji = "✅" if passed else "❌"
-        parent_msg = (
-            f"{status_emoji} *Отчёт о чтении*\n\n"
-            f"👦 {child_name}\n"
-            f"📖 Книга: _{session['book_title']}_\n"
-            f"📄 Страницы: {session['pages']}\n"
-            f"⭐ Оценка: *{score}/100*\n\n"
-            f"🗣 *Пересказ:*\n_{retelling}_\n\n"
-            f"🔍 *Анализ:*\n{summary}"
-        )
+        # Уведомление родителю
+        child_name = update.effective_user.first_name or "Ребёнок"
+        emoji = "✅" if passed else "❌"
         await context.bot.send_message(
-            chat_id=PARENT_CHAT_ID, text=parent_msg, parse_mode="Markdown"
+            chat_id=PARENT_CHAT_ID,
+            text=(
+                f"{emoji} *Отчёт о чтении*\n\n"
+                f"👦 {child_name}\n"
+                f"📖 _{title}_\n"
+                f"📄 Страницы: {pages}\n"
+                f"⭐ Оценка: *{score}/100*\n\n"
+                f"🗣 *Пересказ:*\n_{retelling}_\n\n"
+                f"🔍 *Анализ:*\n{summary}"
+            ),
+            parse_mode="Markdown",
         )
 
     except Exception as e:
-        logger.error("Error: %s", e, exc_info=True)
+        logger.error("Audio error: %s", e, exc_info=True)
         await update.message.reply_text("😔 Ошибка. Напиши /start и попробуй снова.")
     finally:
         sessions.pop(chat_id, None)
@@ -442,36 +524,50 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    rows = db_get_history(chat_id)
+    if not rows:
+        await update.message.reply_text("📭 Истории пока нет.")
+        return
+    lines = ["📊 *История чтения:*\n"]
+    for r in rows:
+        emoji = "✅" if r["passed"] else "❌"
+        lines.append(f"{emoji} _{r['title']}_ стр. {r['pages']} — {r['score']}/100")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     sessions.pop(update.effective_chat.id, None)
-    await update.message.reply_text("❌ Отменено. Напиши /start чтобы начать заново.", reply_markup=kb_remove())
+    await update.message.reply_text("❌ Отменено. Напиши /start.", reply_markup=kb_remove())
     return ConversationHandler.END
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 #  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAIT_BOOK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_book_title)],
+            WAIT_CONTINUE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_continue)],
+            WAIT_BOOK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             WAIT_PAGES:      [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pages)],
             WAIT_PHOTOS: [
                 MessageHandler(filters.PHOTO, receive_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, photos_done),
             ],
-            WAIT_AUDIO: [MessageHandler(filters.VOICE, receive_audio)],
+            WAIT_AUDIO:      [MessageHandler(filters.VOICE, receive_audio)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
-
     app.add_handler(conv)
-    logger.info("Bot v3 started.")
+    app.add_handler(CommandHandler("history", cmd_history))
+    logger.info("Bot v4 started.")
     app.run_polling(drop_pending_updates=True)
 
 
