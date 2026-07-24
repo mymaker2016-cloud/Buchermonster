@@ -357,7 +357,7 @@ async def recv_pages(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     sessions[cid]["pages"] = pages
 
     # ── Поиск книги онлайн ───────────────────────────────────────
-    search_msg = await update.message.reply_text(
+    await update.message.reply_text(
         "🔍 Ищу книгу онлайн...", reply_markup=kb_none())
     try:
         result = search_book_text(book, pages)
@@ -368,7 +368,7 @@ async def recv_pages(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if result["found"]:
         sessions[cid]["book_text"] = result["text"]
         sessions[cid]["source"]    = result["source"]
-        await search_msg.edit_text(
+        await update.message.reply_text(
             f"✅ Нашёл книгу ({result['source']})!\n\n"
             "🎙 Запиши *голосовое сообщение* — расскажи своими словами что прочитал на этих страницах.",
             parse_mode="Markdown")
@@ -377,7 +377,7 @@ async def recv_pages(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         sessions[cid]["book_text"] = ""
         sessions[cid]["source"]    = "фото"
         sessions[cid]["photos"]    = []
-        await search_msg.edit_text(
+        await update.message.reply_text(
             "😕 Не нашёл книгу в интернете.\n\n"
             "📷 Сфотографируй страницы книги которые ты читал и отправь фото сюда.\n"
             "Можно несколько фото подряд.\n"
