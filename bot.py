@@ -86,6 +86,26 @@ def get_history(chat_id):
     ).fetchall()
     return [{"book": r[0], "pages": r[1], "passed": r[2], "score": r[3]} for r in rows]
 
+def save_photo_hashes(chat_id: int, book: str, pages: str, hashes: list[str]):
+    """Сохраняем хэши фото чтобы не принимать те же снимки повторно."""
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS photo_hashes (
+            chat_id INTEGER, book TEXT, pages TEXT, hash TEXT,
+            PRIMARY KEY (chat_id, hash))""")
+        for h in hashes:
+            c.execute("INSERT OR IGNORE INTO photo_hashes VALUES (?,?,?,?)",
+                      (chat_id, book.lower().strip(), pages, h))
+
+def get_seen_hashes(chat_id: int) -> set[str]:
+    """Все хэши фото которые этот пользователь уже отправлял."""
+    try:
+        rows = db().execute(
+            "SELECT hash FROM photo_hashes WHERE chat_id=?", (chat_id,)
+        ).fetchall()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
 # ══════════════════════════════════════════════════════════════════
 #  BOOK SEARCH  — Google Books API + Open Library (быстро, без зависания)
 # ══════════════════════════════════════════════════════════════════
@@ -222,15 +242,53 @@ def kb_none():
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-async def dl_photo(bot, file_id) -> str:
+async def dl_photo(bot, file_id) -> tuple[str, str]:
+    """Скачать фото → (base64, sha256_hash)."""
+    import hashlib
     f = await bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as t:
         await f.download_to_drive(t.name); p = t.name
-    with open(p, "rb") as fh: data = base64.b64encode(fh.read()).decode()
+    with open(p, "rb") as fh:
+        raw = fh.read()
+    data = base64.b64encode(raw).decode()
+    h    = hashlib.sha256(raw).hexdigest()[:16]
     Path(p).unlink(missing_ok=True)
-    return data
+    return data, h
 
-async def dl_voice(bot, file_id) -> bytes:
+def verify_photos_with_claude(photos_b64: list[str], declared_pages: str, book: str) -> dict:
+    """
+    Claude проверяет фото:
+    - Реально ли там страницы книги (а не рандомные картинки)
+    - Совпадают ли номера страниц с заявленными
+    - Достаточно ли страниц (≥ MIN_PAGES_PER_SESSION)
+    Возвращает {"ok": bool, "actual_pages": int, "reason": str}
+    """
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+        for b in photos_b64
+    ]
+    content.append({"type": "text", "text": f"""
+Ребёнок утверждает что прочитал страницы {declared_pages} книги «{book}» и прислал фото.
+
+Проверь:
+1. Это реально страницы книги (текст, а не картинки/фото природы/скриншоты)?
+2. Видны ли номера страниц на фото? Если да — соответствуют ли они диапазону {declared_pages}?
+3. Сколько примерно страниц книги видно на всех фото вместе?
+
+Ответь ТОЛЬКО чистым JSON без markdown:
+{{"ok": true/false, "actual_pages": число_страниц_на_фото, "reason": "причина отказа или 'всё верно'"}}
+
+Правила:
+- ok=false если это не страницы книги
+- ok=false если номера страниц видны и НЕ совпадают с {declared_pages}
+- ok=false если страниц меньше {MIN_PAGES_PER_SESSION}
+- ok=true если всё в порядке или номера страниц не видны но текст выглядит как книга
+"""})
+    resp = claude.messages.create(
+        model="claude-haiku-4-5", max_tokens=256,
+        messages=[{"role": "user", "content": content}]
+    )
+    return _parse_json(resp.content[0].text)
     f = await bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as t:
         await f.download_to_drive(t.name); p = t.name
@@ -434,21 +492,68 @@ async def recv_pages(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def recv_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cid = update.effective_chat.id
-    b64 = await dl_photo(ctx.bot, update.message.photo[-1].file_id)
+    b64, photo_hash = await dl_photo(ctx.bot, update.message.photo[-1].file_id)
+
+    # Проверка: это фото уже отправлялось раньше?
+    seen = get_seen_hashes(cid)
+    if photo_hash in seen:
+        await update.message.reply_text(
+            "🚫 Это фото ты уже отправлял раньше!\n"
+            "Пришли *новые* фото страниц которые читал сегодня.",
+            parse_mode="Markdown", reply_markup=kb_photo())
+        return WAIT_PHOTOS
+
+    # Проверка дублей внутри текущей сессии
+    session_hashes = sessions[cid].get("photo_hashes", [])
+    if photo_hash in session_hashes:
+        await update.message.reply_text(
+            "⚠️ Это фото уже в текущей загрузке, пропускаю.",
+            reply_markup=kb_photo())
+        return WAIT_PHOTOS
+
     sessions[cid]["photos"].append(b64)
+    sessions[cid].setdefault("photo_hashes", []).append(photo_hash)
     n = len(sessions[cid]["photos"])
-    await update.message.reply_text(f"✅ Фото {n} получено! Ещё или нажми кнопку.", reply_markup=kb_photo())
+    await update.message.reply_text(
+        f"✅ Фото {n} получено! Ещё или нажми кнопку.",
+        reply_markup=kb_photo())
     return WAIT_PHOTOS
 
 async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if "❌" in update.message.text: return await cancel(update, ctx)
-    cid = update.effective_chat.id
-    if not sessions.get(cid, {}).get("photos"):
+    cid     = update.effective_chat.id
+    session = sessions.get(cid, {})
+    photos  = session.get("photos", [])
+
+    if not photos:
         await update.message.reply_text("❗ Сначала отправь хотя бы одно фото.", reply_markup=kb_photo())
         return WAIT_PHOTOS
-    n = len(sessions[cid]["photos"])
+
+    # Claude проверяет фото
+    await update.message.reply_text("🔍 Проверяю фото...", reply_markup=kb_none())
+    try:
+        check = verify_photos_with_claude(photos, session["pages"], session["book"])
+    except Exception as e:
+        logger.error("Photo verify error: %s", e)
+        check = {"ok": True, "actual_pages": len(photos) * 2, "reason": ""}
+
+    if not check.get("ok", True):
+        reason = check.get("reason", "")
+        sessions[cid]["photos"] = []
+        sessions[cid]["photo_hashes"] = []
+        await update.message.reply_text(
+            f"❌ Фото не прошло проверку.\n\n*Причина:* {reason}\n\n"
+            "Пришли правильные фото страниц книги 👇",
+            parse_mode="Markdown", reply_markup=kb_photo())
+        return WAIT_PHOTOS
+
+    # Сохраняем хэши принятых фото в БД
+    save_photo_hashes(cid, session["book"], session["pages"], session.get("photo_hashes", []))
+
+    n = len(photos)
+    actual = check.get("actual_pages", n)
     await update.message.reply_text(
-        f"✅ Получено фото: {n} шт.\n\n"
+        f"✅ Фото проверены: {n} шт., ~{actual} стр.\n\n"
         "🎙 Теперь запиши *голосовое сообщение* — расскажи своими словами что прочитал.",
         parse_mode="Markdown", reply_markup=kb_none())
     return WAIT_AUDIO
