@@ -369,9 +369,57 @@ def _parse_json(raw: str) -> dict:
 #  HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
+def get_failed_audio(chat_id: int) -> dict | None:
+    """Возвращает незачтённую сессию если ребёнок не прошёл аудио."""
+    try:
+        r = db().execute(
+            """SELECT book, pages, book_text, source FROM last_book
+               WHERE chat_id=? AND book != ''""", (chat_id,)
+        ).fetchone()
+        if not r:
+            return None
+        book, pages = r[0], r[1]
+        # Проверяем: эти страницы ещё не сданы (passed=0 или нет записи)
+        res = db().execute(
+            "SELECT passed FROM progress WHERE chat_id=? AND book=? AND pages=?",
+            (chat_id, book.lower().strip(), pages)
+        ).fetchone()
+        if res and res[0] == 1:
+            return None  # уже сдано
+        if res and res[0] == 0:
+            return {"book": r[0], "pages": r[1], "book_text": r[2] or "", "source": r[3] or ""}
+        return None
+    except Exception:
+        return None
+
+def kb_retry_audio():
+    return ReplyKeyboardMarkup(
+        [["🎙 Записать пересказ заново"]],
+        resize_keyboard=True, one_time_keyboard=True)
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cid  = update.effective_chat.id
     name = update.effective_user.first_name or "друг"
+
+    # Проверка: есть ли незачтённая попытка аудио?
+    failed = get_failed_audio(cid)
+    if failed:
+        sessions[cid] = {
+            "photos": [],
+            "book": failed["book"],
+            "pages": failed["pages"],
+            "book_text": failed["book_text"],
+            "source": failed["source"],
+            "retry_audio": True,
+        }
+        await update.message.reply_text(
+            f"⚠️ {name}, ты ещё не сдал пересказ!\n\n"
+            f"📖 Книга: *«{failed['book']}»*, стр. *{failed['pages']}*\n\n"
+            "Пока не запишешь пересказ — начать новое задание нельзя.\n"
+            "Нажми кнопку и запиши голосовое сообщение 👇",
+            parse_mode="Markdown", reply_markup=kb_retry_audio())
+        return WAIT_AUDIO
+
     sessions[cid] = {"photos": []}
     last = get_last(cid)
     if last:
@@ -598,26 +646,34 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
         if passed:
             child_msg = f"🎉 *Отлично! Молодец!*\n\n💬 {feedback}\n\n⭐ *{score}/100*"
+            await update.message.reply_text(child_msg, parse_mode="Markdown")
+            sessions.pop(cid, None)  # сдал — сессию закрываем
         else:
             child_msg = (f"🤔 *Почти! Попробуй ещё раз.*\n\n💬 {feedback}\n\n"
-                         f"⭐ *{score}/100*\n\nНапиши /start чтобы попробовать снова.")
-        await update.message.reply_text(child_msg, parse_mode="Markdown")
+                         f"⭐ *{score}/100*\n\n"
+                         "Нажми кнопку и запиши пересказ заново 👇")
+            await update.message.reply_text(child_msg, parse_mode="Markdown",
+                                            reply_markup=kb_retry_audio())
+            # Сессию НЕ закрываем — ребёнок должен повторить
 
         name  = update.effective_user.first_name or "Ребёнок"
         emoji = "✅" if passed else "❌"
+        attempt = session.get("attempt", 1)
         source_note = f"(источник: {session.get('source', '?')})"
+        attempt_note = f" | попытка {attempt}" if attempt > 1 else ""
         await ctx.bot.send_message(
             chat_id=PARENT_CHAT_ID,
-            text=(f"{emoji} *Отчёт о чтении* {source_note}\n\n"
+            text=(f"{emoji} *Отчёт о чтении* {source_note}{attempt_note}\n\n"
                   f"👦 {name}\n📖 _{book}_\n📄 Стр. {pages}\n⭐ *{score}/100*\n\n"
                   f"🗣 *Пересказ:*\n_{retelling}_\n\n🔍 *Анализ:*\n{summary}"),
             parse_mode="Markdown")
+        if not passed:
+            sessions[cid]["attempt"] = attempt + 1  # считаем попытки
     except Exception as e:
         logger.error("Error: %s", e, exc_info=True)
-        await update.message.reply_text("😔 Ошибка. Напиши /start и попробуй снова.")
-    finally:
-        sessions.pop(cid, None)
-    return ConversationHandler.END
+        await update.message.reply_text("😔 Ошибка. Попробуй записать пересказ ещё раз.",
+                                        reply_markup=kb_retry_audio())
+    return WAIT_AUDIO
 
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = get_history(update.effective_chat.id)
