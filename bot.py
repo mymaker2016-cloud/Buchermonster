@@ -310,50 +310,101 @@ def transcribe(audio: bytes) -> str:
     finally:
         Path(p).unlink(missing_ok=True)
 
-def check_by_text(book_text: str, retelling: str, pages: str, title: str) -> dict:
-    """Проверка пересказа по тексту книги (найден онлайн)."""
-    prompt = f"""Ты добрый учитель начальной школы.
+def extract_key_moments(book_text: str, pages: str, title: str) -> list[dict]:
+    """Шаг 1: извлечь 3-5 ключевых момента из текста."""
+    prompt = (
+        f"Ты опытный учитель литературы. Прочитай текст книги «{title}» (стр. {pages}).\n\n"
+        "Выдели 3-5 КЛЮЧЕВЫХ момента которые ребёнок ОБЯЗАН упомянуть в пересказе.\n"
+        "Критерии: сюжетные повороты, действия героев, важные события.\n\n"
+        "Ответь ТОЛЬКО чистым JSON — массив объектов:\n"
+        '[{"moment": "описание (1 предл.)", "required": true}, ...]\n\n'
+        "required=true — 2-3 самых важных (без них текст явно не прочитан).\n"
+        "required=false — детали, желательные но не обязательные.\n\n"
+        f"ТЕКСТ:\n\"\"\"\n{book_text[:4000]}\n\"\"\"\n"
+    )
+    resp = claude.messages.create(
+        model="claude-opus-4-5", max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip()
+    if "```" in raw:
+        for part in raw.split("```"):
+            part = part.strip().lstrip("json").strip()
+            if part.startswith("["):
+                raw = part; break
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    try:
+        return json.loads(m.group() if m else raw)
+    except Exception:
+        return []
 
-КНИГА: «{title}», страницы {pages}
-ТЕКСТ КНИГИ:
-\"\"\"{book_text[:3500]}\"\"\"
 
-ПЕРЕСКАЗ РЕБЁНКА:
-\"\"\"{retelling}\"\"\"
+def extract_key_moments_from_photos(photos: list[str], pages: str, title: str) -> tuple[list[dict], str]:
+    """Шаг 1 для фото: OCR + ключевые моменты за один вызов."""
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+        for b in photos
+    ]
+    content.append({"type": "text", "text": (
+        f"На фото — страницы {pages} книги «{title}».\n\n"
+        "Сделай два дела:\n"
+        "1. Прочитай текст с фото.\n"
+        "2. Выдели 3-5 КЛЮЧЕВЫХ момента которые ребёнок ОБЯЗАН упомянуть (required=true для 2-3 самых важных).\n\n"
+        "Ответь ТОЛЬКО чистым JSON:\n"
+        '{"book_text": "первые 300 символов текста", "key_moments": [{"moment": "...", "required": true}]}'
+    )})
+    resp = claude.messages.create(
+        model="claude-opus-4-5", max_tokens=2048,
+        messages=[{"role": "user", "content": content}]
+    )
+    data = _parse_json(resp.content[0].text)
+    return data.get("key_moments", []), data.get("book_text", "")
 
-Оцени: главные события, смысл, детали.
-Ответь ТОЛЬКО чистым JSON без markdown:
-{{"passed": true/false, "score": 0-100, "feedback": "для ребёнка — дружелюбно", "summary": "для родителя — 2-3 предложения"}}"""
+
+def check_retelling_against_moments(key_moments: list[dict], retelling: str, pages: str, title: str) -> dict:
+    """Шаг 2: проверить пересказ против ключевых моментов."""
+    moments_text = "\n".join(
+        f"- {'[ОБЯЗАТЕЛЬНО]' if m.get('required') else '[ЖЕЛАТЕЛЬНО]'} {m['moment']}"
+        for m in key_moments
+    )
+    prompt = (
+        f"Ты добрый но строгий учитель начальной школы.\n\n"
+        f"КНИГА: «{title}», страницы {pages}\n\n"
+        f"КЛЮЧЕВЫЕ МОМЕНТЫ которые должен упомянуть ребёнок:\n{moments_text}\n\n"
+        f"ПЕРЕСКАЗ РЕБЁНКА:\n\"\"\"\n{retelling}\n\"\"\"\n\n"
+        "Проверь КАЖДЫЙ момент — упомянут ли он (точно или близко по смыслу).\n\n"
+        "Правила:\n"
+        "- passed=false если пропущен хотя бы ОДИН [ОБЯЗАТЕЛЬНО] момент\n"
+        "- score = % упомянутых моментов из всех\n"
+        "- Засчитывай если смысл передан другими словами\n\n"
+        "Ответь ТОЛЬКО чистым JSON:\n"
+        '{"passed": true/false, "score": 0-100, '
+        '"feedback": "для ребёнка — дружелюбно, укажи что пропустил (1-2 предл.)", '
+        '"summary": "для родителя — что упомянул, что пропустил (2-3 предл.)", '
+        '"missed_required": ["..."], "missed_optional": ["..."]}'
+    )
     resp = claude.messages.create(
         model="claude-opus-4-5", max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
     return _parse_json(resp.content[0].text)
 
+
+def check_by_text(book_text: str, retelling: str, pages: str, title: str) -> dict:
+    """Двухэтапная проверка по тексту книги."""
+    moments = extract_key_moments(book_text, pages, title)
+    if not moments:
+        moments = [{"moment": "основные события и герои", "required": True}]
+    return check_retelling_against_moments(moments, retelling, pages, title)
+
+
 def check_by_photos(photos: list[str], retelling: str, pages: str, title: str) -> dict:
-    """OCR + проверка пересказа по фото страниц — один вызов Claude."""
-    content = [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
-        for b in photos
-    ]
-    content.append({"type": "text", "text": f"""
-Это фото страниц {pages} книги «{title}».
+    """Двухэтапная проверка по фото."""
+    moments, _ = extract_key_moments_from_photos(photos, pages, title)
+    if not moments:
+        moments = [{"moment": "основные события и герои", "required": True}]
+    return check_retelling_against_moments(moments, retelling, pages, title)
 
-1. Прочитай текст с фото.
-2. Сравни с пересказом ребёнка.
-3. Оцени понимание.
-
-ПЕРЕСКАЗ РЕБЁНКА:
-\"\"\"{retelling}\"\"\"
-
-Ответь ТОЛЬКО чистым JSON без markdown:
-{{"passed": true/false, "score": 0-100, "feedback": "для ребёнка — дружелюбно", "summary": "для родителя — 2-3 предложения"}}
-"""})
-    resp = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=1024,
-        messages=[{"role": "user", "content": content}]
-    )
-    return _parse_json(resp.content[0].text)
 
 def _parse_json(raw: str) -> dict:
     raw = raw.strip()
@@ -636,10 +687,12 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             # Книга не найдена — OCR фото + сравнение (один вызов Claude)
             result = check_by_photos(session["photos"], retelling, pages, book)
 
-        passed   = result.get("passed", False)
-        score    = result.get("score", 0)
-        feedback = result.get("feedback", "")
-        summary  = result.get("summary", "")
+        passed          = result.get("passed", False)
+        score           = result.get("score", 0)
+        feedback        = result.get("feedback", "")
+        summary         = result.get("summary", "")
+        missed_required = result.get("missed_required", [])
+        missed_optional = result.get("missed_optional", [])
 
         save_result(cid, book, pages, passed, score)
         save_last(cid, book, pages, session.get("book_text", ""), session.get("source", ""))
@@ -647,28 +700,37 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if passed:
             child_msg = f"🎉 *Отлично! Молодец!*\n\n💬 {feedback}\n\n⭐ *{score}/100*"
             await update.message.reply_text(child_msg, parse_mode="Markdown")
-            sessions.pop(cid, None)  # сдал — сессию закрываем
+            sessions.pop(cid, None)
         else:
-            child_msg = (f"🤔 *Почти! Попробуй ещё раз.*\n\n💬 {feedback}\n\n"
-                         f"⭐ *{score}/100*\n\n"
+            missed_str = ""
+            if missed_required:
+                missed_str = "\n\n❗ *Не упомянул важное:*\n" + "\n".join(f"• {m}" for m in missed_required)
+            child_msg = (f"🤔 *Почти! Попробуй ещё раз.*\n\n💬 {feedback}"
+                         f"{missed_str}\n\n⭐ *{score}/100*\n\n"
                          "Нажми кнопку и запиши пересказ заново 👇")
             await update.message.reply_text(child_msg, parse_mode="Markdown",
                                             reply_markup=kb_retry_audio())
-            # Сессию НЕ закрываем — ребёнок должен повторить
 
         name  = update.effective_user.first_name or "Ребёнок"
         emoji = "✅" if passed else "❌"
         attempt = session.get("attempt", 1)
-        source_note = f"(источник: {session.get('source', '?')})"
+        source_note  = f"(источник: {session.get('source', '?')})"
         attempt_note = f" | попытка {attempt}" if attempt > 1 else ""
+
+        # Формируем детальный отчёт для родителя
+        missed_req_str = ("\n🔴 *Пропустил обязательное:*\n" + "\n".join(f"• {m}" for m in missed_required)) if missed_required else ""
+        missed_opt_str = ("\n🟡 *Пропустил детали:*\n" + "\n".join(f"• {m}" for m in missed_optional)) if missed_optional else ""
+
         await ctx.bot.send_message(
             chat_id=PARENT_CHAT_ID,
             text=(f"{emoji} *Отчёт о чтении* {source_note}{attempt_note}\n\n"
                   f"👦 {name}\n📖 _{book}_\n📄 Стр. {pages}\n⭐ *{score}/100*\n\n"
-                  f"🗣 *Пересказ:*\n_{retelling}_\n\n🔍 *Анализ:*\n{summary}"),
+                  f"🔍 *Анализ:*\n{summary}"
+                  f"{missed_req_str}{missed_opt_str}\n\n"
+                  f"🗣 *Пересказ:*\n_{retelling}_"),
             parse_mode="Markdown")
         if not passed:
-            sessions[cid]["attempt"] = attempt + 1  # считаем попытки
+            sessions[cid]["attempt"] = attempt + 1
     except Exception as e:
         logger.error("Error: %s", e, exc_info=True)
         await update.message.reply_text("😔 Ошибка. Попробуй записать пересказ ещё раз.",
