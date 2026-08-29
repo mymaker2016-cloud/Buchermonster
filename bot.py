@@ -452,6 +452,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cid  = update.effective_chat.id
     name = update.effective_user.first_name or "друг"
 
+    # Сбрасываем старую сессию если есть (ребёнок мог застрять)
+    sessions.pop(cid, None)
+
     # Проверка: есть ли незачтённая попытка аудио?
     failed = get_failed_audio(cid)
     if failed:
@@ -767,9 +770,16 @@ def main():
                 MessageHandler(filters.PHOTO, recv_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, photos_done),
             ],
-            WAIT_AUDIO: [MessageHandler(filters.VOICE, recv_audio)],
+            WAIT_AUDIO: [
+                MessageHandler(filters.VOICE, recv_audio),
+                # Если ребёнок жмёт /start внутри WAIT_AUDIO — сбрасываем и стартуем заново
+                CommandHandler("start", start),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),   # /start всегда сбрасывает любое состояние
+        ],
         allow_reentry=True,
     )
     app.add_handler(conv)
