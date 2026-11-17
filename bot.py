@@ -674,15 +674,22 @@ def check_detail_answers(qa: list[dict], answers: list[dict]) -> list[dict]:
         "Цель — убедиться, что ребёнок читал текст, а не наказать его. Засчитывай, если ключевой факт совпадает по смыслу, "
         "даже если ответ сбивчивый. Не засчитывай уклончивые, слишком общие ответы и согласие с заведомо неверной деталью.\n\n"
         + "\n".join(lines) + "\n\n"
+        "Для каждого пункта добавь реплики от лица доброго родителя, который принимает рассказ: тёплый юмор, "
+        "без сарказма и унижения, 13-летнему ребёнку, по-русски, одно короткое предложение:\n"
+        "- reaction: реакция на ответ (если верно — похвали с шуткой; если неверно — мягко подшути, подбодри);\n"
+        "- hint: ТОЛЬКО если ответ неверный — наводка для второй попытки: не называй правильный ответ, "
+        "а подтолкни («Почти, но что-то там было не так… вспомни, кто ещё был рядом»). Для ловушки с неверной "
+        "деталью намекни: «а ты уверен, что именно так?». Если верно — hint пустой.\n\n"
         "Ответь ТОЛЬКО чистым JSON без markdown, по одному объекту на пункт по порядку:\n"
-        '{"results": [{"correct": true, "comment": "до 10 слов"}]}'
+        '{"results": [{"correct": true, "comment": "до 10 слов", "reaction": "...", "hint": "..."}]}'
     )
     data = claude_json([{"role": "user", "content": prompt}], 600)
     raw = data.get("results", [])
     out = []
     for i in range(len(qa)):
         r = raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
-        out.append({"correct": bool(r.get("correct")), "comment": str(r.get("comment", ""))})
+        out.append({"correct": bool(r.get("correct")), "comment": str(r.get("comment", "")),
+                    "reaction": str(r.get("reaction", "")), "hint": str(r.get("hint", ""))})
     return out
 
 
@@ -736,14 +743,18 @@ def build_parent_report(*, status, name, cid, book, pages, stats, score, attempt
         L += ["", "🎯 Наводящие вопросы о пропущенном в пересказе:"]
         for i, r in enumerate(probes, 1):
             trap = "верная деталь" if r.get("premise_true") else "ЛОЖНАЯ деталь (ловушка)"
-            L += [f"{i}) {'✅' if r['correct'] else '❌'} [{trap}] {clip(r['question'], 200)}",
-                  f"   Ответил: {clip(r['answer'], 250)}{_slow(r)}",
+            L += [f"{i}) {'✅' if r['correct'] else '❌'}{' (со 2-й попытки)' if r.get('tries') == 2 and r['correct'] else ''} [{trap}] {clip(r['question'], 200)}"]
+            if r.get("first_answer"):
+                L += [f"   1-й ответ: {clip(r['first_answer'], 200)}"]
+            L += [f"   Ответил: {clip(r['answer'], 250)}{_slow(r)}",
                   f"   На самом деле: {clip(r['expected'], 200)}"]
     if details:
         L += ["", "❓ Вопросы по деталям:"]
         for i, r in enumerate(details, 1):
-            L += [f"{i}) {'✅' if r['correct'] else '❌'} {clip(r['question'], 200)}",
-                  f"   Ответил: {clip(r['answer'], 250)}{_slow(r)}",
+            L += [f"{i}) {'✅' if r['correct'] else '❌'}{' (со 2-й попытки)' if r.get('tries') == 2 and r['correct'] else ''} {clip(r['question'], 200)}"]
+            if r.get("first_answer"):
+                L += [f"   1-й ответ: {clip(r['first_answer'], 200)}"]
+            L += [f"   Ответил: {clip(r['answer'], 250)}{_slow(r)}",
                   f"   Верно: {clip(r['expected'], 200)}"]
     for n in (notes or []):
         L += ["", "ℹ️ " + n]
@@ -1039,9 +1050,10 @@ async def ask_question(update: Update, session: dict):
     session["qa_asked_at"] = time.time()
     intro = ""
     if i == 0:
-        intro = (f"👍 Спасибо за пересказ! Теперь {len(session['qa'])} коротких вопроса, чтобы убедиться, что всё уловил.\n"
-                 "Это не экзамен. Вопросы с подвохом: я могу ошибаться специально. "
-                 "Если спрашиваю о событии — расскажи, что там было; если что-то напутал — поправь меня.\n\n")
+        intro = (f"📚 Ого, спасибо за рассказ! Теперь у меня {len(session['qa'])} вопросов — как будто я сам "
+                 "пытаюсь вспомнить книгу.\n"
+                 "Предупреждаю: я могу путать детали специально 😏 Если что-то не так — поправь меня. "
+                 "А если ответишь не с первого раза — дам подсказку и второй шанс.\n\n")
     await update.message.reply_text(
         f"{intro}❓ Вопрос {i + 1} из {len(session['qa'])}\n\n{q['question']}\n\n🎙 Ответь голосовым сообщением.",
         reply_markup=kb_none())
@@ -1066,8 +1078,8 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
         if len(retelling.split()) < 6:
             await update.message.reply_text(
-                "🙂 Получилось совсем коротко. Расскажи своими словами всё, что запомнил из этих страниц — "
-                "пусть не всё, главное, что помнишь.",
+                "🙂 Ммм, коротковато — я даже не успел заскучать 😄 Расскажи подробнее, "
+                "что запомнил из этих страниц. Пусть не всё, главное то, что помнишь.",
                 reply_markup=kb_retry_audio())
             return WAIT_AUDIO
 
@@ -1088,8 +1100,8 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             session["attempt"] = attempt + 1
             pending_update(cid, attempt=attempt + 1)
             await update.message.reply_text(
-                "🤔 Пока непонятно, о чём ты читал: пересказ не похож на эти страницы. "
-                "Расскажи ещё раз своими словами, что запомнил — достаточно главного 👇",
+                "🤔 Эээ, пока не пойму, о чём ты читал: рассказ немного не про эти страницы. "
+                "Попробуй ещё раз, своими словами — достаточно главного, я не придираюсь 😉",
                 reply_markup=kb_retry_audio())
             await notify_parent(ctx, build_parent_report(
                 status="❌ Пересказ слишком скудный", name=name, cid=cid, book=book, pages=pages,
@@ -1118,7 +1130,7 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         qa = probes + details
         random.shuffle(qa)          # ловушки перемешаны с обычными вопросами
 
-        session.update({"retelling": retelling, "result": result, "qa": qa, "qa_answers": []})
+        session.update({"retelling": retelling, "result": result, "qa": qa, "qa_answers": [], "qa_try": 1, "qa_first": None, "qa_rows": []})
         if not qa:
             return await finalize(update, ctx, session, qa_passed=True, qa_rows=[],
                                   notes=notes + ["Вопросов не сформировано — принято только по пересказу."])
@@ -1149,30 +1161,53 @@ async def recv_qa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Не расслышал. Запиши ответ ещё раз 🎙")
         return WAIT_QA
 
-    session["qa_answers"].append({"text": text, "latency": latency})
-    if len(session["qa_answers"]) < len(session["qa"]):
-        await ask_question(update, session)
-        return WAIT_QA
+    idx = len(session["qa_answers"])
+    q = session["qa"][idx]
+    tries = session.get("qa_try", 1)
+    first = session.get("qa_first")
 
-    await update.message.reply_text("🧠 Проверяю ответы...")
+    await update.message.reply_text("🧐 Хм, сейчас оценю...")
     try:
-        results = await asyncio.to_thread(check_detail_answers, session["qa"], session["qa_answers"])
+        r = (await asyncio.to_thread(check_detail_answers, [q], [{"text": text, "latency": latency}]))[0]
     except Exception as e:
         logger.error("QA check error: %s", e, exc_info=True)
-        session["qa_answers"] = []
-        await update.message.reply_text("😔 Не смог проверить ответы. Давай ещё раз с первого вопроса.")
+        await update.message.reply_text("😔 У меня что-то заглючило. Ответь на этот вопрос ещё раз 🎙")
+        return WAIT_QA
+
+    # Неверно с первой попытки → вторая попытка с наводкой
+    if not r["correct"] and tries == 1:
+        session["qa_try"] = 2
+        session["qa_first"] = {"text": text, "latency": latency}
+        session["qa_asked_at"] = time.time()
+        hint = r.get("hint") or "Почти, но что-то не сходится… Подумай ещё чуть-чуть."
+        await update.message.reply_text(
+            f"🤔 {r.get('reaction') or 'Хм, не совсем так.'}\n\n"
+            f"💡 Подсказка: {hint}\n\n"
+            f"Вопрос ещё раз: {q['question']}\n\n🎙 Попробуй ответить ещё раз — это второй шанс!",
+            reply_markup=kb_none())
+        return WAIT_QA
+
+    pts = (1.0 if tries == 1 else 0.5) if r["correct"] else 0.0
+    session.setdefault("qa_rows", []).append({
+        "kind": q.get("kind", "detail"), "premise_true": q.get("premise_true"), "part": q.get("part", ""),
+        "question": q["question"], "expected": q["expected"],
+        "answer": text, "latency": latency,
+        "first_answer": first["text"] if first else "", "tries": tries,
+        "correct": r["correct"], "points": pts, "comment": r["comment"]})
+    session["qa_answers"].append({"text": text, "latency": latency})
+    session["qa_try"] = 1
+    session["qa_first"] = None
+
+    react = r.get("reaction") or ("Верно! 👏" if r["correct"] else "Ничего, идём дальше.")
+    if len(session["qa_answers"]) < len(session["qa"]):
+        await update.message.reply_text(("✅ " if r["correct"] else "😉 ") + react)
         await ask_question(update, session)
         return WAIT_QA
 
-    rows = [{"kind": q.get("kind", "detail"), "premise_true": q.get("premise_true"), "part": q.get("part", ""),
-             "question": q["question"], "expected": q["expected"],
-             "answer": a["text"], "latency": a["latency"],
-             "correct": r["correct"], "comment": r["comment"]}
-            for q, a, r in zip(session["qa"], session["qa_answers"], results)]
-
-    correct = sum(r["correct"] for r in rows)
-    need = len(rows) - len(rows) // 3        # 4 из 4→3, 5→4, 3→2: одна ошибка на каждые три вопроса допустима
-    qa_passed = correct >= need
+    await update.message.reply_text(("✅ " if r["correct"] else "😉 ") + react)
+    rows = session.pop("qa_rows")
+    points = sum(x["points"] for x in rows)
+    qa_passed = points >= 0.6 * len(rows)     # 4 вопроса → нужно ≥2,4 балла: 3 с первого раза или 2+2 со второго шанса
     return await finalize(update, ctx, session, qa_passed=qa_passed, qa_rows=rows)
 
 
@@ -1214,23 +1249,23 @@ async def finalize(update: Update, ctx: ContextTypes.DEFAULT_TYPE, session: dict
         timer_clear(cid)
         sessions.pop(cid, None)
         await update.message.reply_text(
-            f"🎉 Принято! Молодец!\n\n💬 {result.get('feedback', '')}\n\n⭐ {score}/100",
+            f"🎉 Всё, засчитано! Видно, что книгу читал, а не бегал по абзацам 😄\n\n💬 {result.get('feedback', '')}\n\n⭐ {score}/100",
             reply_markup=kb_none())
         status = "✅ ПРИНЯТО"
     else:
         session["attempt"] = attempt + 1
         pending_update(cid, attempt=attempt + 1)
-        for k in ("qa", "qa_answers", "retelling", "result"):
+        for k in ("qa", "qa_answers", "qa_try", "qa_first", "qa_rows", "retelling", "result"):
             session.pop(k, None)
         weak = part_pages(pages, [r.get("part", "") for r in qa_rows if not r["correct"]])
         where = (f"Особенно обрати внимание на {weak}.\n\n" if weak
                  else f"Перечитай страницы {pages} внимательнее.\n\n")
         await update.message.reply_text(
-            f"🤔 Похоже, часть текста ты читал невнимательно и не до конца понял, что там происходило "
-            f"(верных ответов {correct} из {len(qa_rows)}).\n\n"
-            f"📖 Рекомендую перечитать нужные места. {where}"
-            "Это не наказание: мне важно убедиться, что ты вник в текст. "
-            "Когда будешь готов — запиши пересказ заново, вопросы будут другие 👇",
+            f"🤔 Хм, кажется, часть текста пролетела мимо — ты немного не так понял, что там происходило "
+            f"(верно {correct} из {len(qa_rows)}). Возможно, ты что-то упустил, и это нормально!\n\n"
+            f"📖 Загляни в книгу ещё раз. {where}"
+            "Это не наказание, мне просто важно, чтобы ты вник в историю. "
+            "Как будешь готов — расскажи заново, вопросы будут другие 👇",
             reply_markup=kb_retry_audio())
         status = f"❌ НЕ ПРИНЯТО — верных ответов {correct} из {len(qa_rows)}"
 
