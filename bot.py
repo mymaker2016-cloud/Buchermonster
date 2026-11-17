@@ -40,10 +40,10 @@ MIN_PAGES_PER_SESSION = 30  # минимум страниц за одну сда
 
 # ── Настройки (меняются переменными окружения, без правки кода) ──
 MAX_PAGES_PER_HOUR = int(os.environ.get("MAX_PAGES_PER_HOUR", "50"))   # потолок скорости чтения (13 лет)
-QA_COUNT           = int(os.environ.get("QA_COUNT", "5"))              # случайных вопросов по деталям
+QA_COUNT           = int(os.environ.get("QA_COUNT", "4"))              # всего вопросов после пересказа (наводящие + по деталям)
 QA_MIN_CORRECT     = int(os.environ.get("QA_MIN_CORRECT", "4"))        # сколько из QA_COUNT должно быть верными
-PROBE_MAX          = int(os.environ.get("PROBE_MAX", "3"))             # макс. наводящих вопросов о пропущенном
-RETELL_MIN_SCORE   = int(os.environ.get("RETELL_MIN_SCORE", "30"))     # ниже — пересказ слишком скудный
+PROBE_MAX          = int(os.environ.get("PROBE_MAX", "4"))             # макс. наводящих вопросов о пропущенном
+RETELL_MIN_SCORE   = int(os.environ.get("RETELL_MIN_SCORE", "15"))     # ниже — пересказ слишком скудный
 QA_SLOW_SEC        = int(os.environ.get("QA_SLOW_SEC", "90"))          # ответ дольше — помечаем родителю
 ALLOW_ONLINE_TEXT  = os.environ.get("ALLOW_ONLINE_TEXT", "0") == "1"   # 0 = всегда требовать фото страниц
 TIMER_STALE_SEC    = 3 * 3600                                          # завершённый таймер «протухает» через 3 ч
@@ -530,13 +530,18 @@ def analyze_pages(photos: list[str], book_text: str, pages: str, title: str) -> 
         "Ты опытный учитель литературы. Прочитай текст (книга может быть на любом языке).\n\n"
         "1) Выдели 5-8 КЛЮЧЕВЫХ моментов сюжета, равномерно по всему диапазону страниц. "
         "Каждый момент формулируй с конкретной деталью (кто, что, где, с каким предметом или животным) — "
-        "по ней потом будут проверять внимательность. required=true для 3-4 важнейших.\n"
+        "по ней потом будут проверять внимательность. required=true для 3-4 важнейших. "
+        "Поле part: «начало», «середина» или «конец» диапазона.\n"
         "2) Составь 12 вопросов по КОНКРЕТНЫМ деталям: имя, число, предмет, кто что сказал или сделал, "
         "порядок событий. По 4 вопроса из начала, середины и конца диапазона (поле part). "
-        "Вопрос должен требовать знания именно этого текста: по краткому пересказу сюжета на него "
-        "ответить нельзя. Ответ — одно предложение, без «да/нет». Вопросы пиши по-русски.\n\n"
+        "Вопросы должны быть НЕОЧЕВИДНЫМИ и сбивающими с толку: спрашивай о детали, где в тексте есть "
+        "похожие варианты (два похожих персонажа, предмета, места; порядок событий; кто именно что сказал), "
+        "формулируй нейтрально, без подсказок в самом вопросе. Ответ нельзя угадать логикой или по краткому "
+        "пересказу сюжета, нужно помнить именно этот текст. Запрещены вопросы вроде «о чём глава». "
+        "Но вопрос должен быть справедливым: ответ прямо есть в тексте. Ответ — одно предложение, без «да/нет». "
+        "Вопросы пиши по-русски.\n\n"
         "Ответь ТОЛЬКО чистым JSON без markdown:\n"
-        '{"key_moments": [{"moment": "...", "required": true}],'
+        '{"key_moments": [{"moment": "...", "required": true, "part": "начало"}],'
         ' "questions": [{"question": "...", "expected": "правильный ответ", "part": "начало"}]}'
     )
     content.append({"type": "text", "text": src + "\n\n" + rules})
@@ -554,11 +559,12 @@ def analyze_pages(photos: list[str], book_text: str, pages: str, title: str) -> 
     return {"moments": moments, "qpool": qpool}
 
 
-def pick_questions(qpool: list[dict], used: list[int]) -> tuple[list[int], list[int]]:
-    """Выбирает QA_COUNT ещё не задававшихся вопросов, по возможности из разных частей текста."""
+def pick_questions(qpool: list[dict], used: list[int], n: int = 0) -> tuple[list[int], list[int]]:
+    """Выбирает n ещё не задававшихся вопросов, по возможности из разных частей текста."""
+    n = n or QA_COUNT
     all_idx = list(range(len(qpool)))
     unused = [i for i in all_idx if i not in used]
-    if len(unused) < QA_COUNT:
+    if len(unused) < n:
         used, unused = [], all_idx[:]
     random.shuffle(unused)
     picked, parts = [], set()
@@ -567,14 +573,14 @@ def pick_questions(qpool: list[dict], used: list[int]) -> tuple[list[int], list[
         if part not in parts:
             picked.append(i)
             parts.add(part)
-        if len(picked) == QA_COUNT:
+        if len(picked) == n:
             break
     for i in unused:
-        if len(picked) >= QA_COUNT:
+        if len(picked) >= n:
             break
         if i not in picked:
             picked.append(i)
-    picked = picked[:QA_COUNT]
+    picked = picked[:n]
     return picked, used + picked
 
 
@@ -588,14 +594,16 @@ def make_probes(missed: list[str], title: str) -> list[dict]:
         "- q_true: вопрос с ВЕРНОЙ деталью, как было на самом деле;\n"
         "- q_false: тот же вопрос, но с одной правдоподобной НЕВЕРНОЙ деталью "
         "(подменён предмет, животное, место, число или имя), противоречащей событию;\n"
-        "- truth: что на самом деле происходило (1 предложение).\n"
+        "- truth: что на самом деле происходило (1 предложение);\n"
+        "- i: номер события из списка.\n"
+        "Вопросы не должны быть очевидными: неверная деталь должна быть очень похожа на настоящую.\n"
         "Пример. Событие: «Герой подружился с белым голубем». "
         "q_true: «Ты не забыл упомянуть историю с белым голубем?» "
         "q_false: «Ты не забыл упомянуть историю с белым гусем?» "
         "truth: «Герой подружился с белым голубем».\n"
         "Обе формулировки должны звучать одинаково естественно. Пиши по-русски.\n\n"
         "Ответь ТОЛЬКО чистым JSON без markdown, объекты по порядку событий:\n"
-        '{"probes": [{"q_true": "...", "q_false": "...", "truth": "..."}]}'
+        '{"probes": [{"i": 1, "q_true": "...", "q_false": "...", "truth": "..."}]}'
     )
     resp = claude.messages.create(
         model="claude-opus-4-5", max_tokens=1500,
@@ -605,15 +613,20 @@ def make_probes(missed: list[str], title: str) -> list[dict]:
             if isinstance(p, dict) and p.get("q_true") and p.get("q_false") and p.get("truth")]
 
 
-def build_probe_items(missed: list[str], title: str) -> list[dict]:
+def build_probe_items(missed: list[str], title: str, moments: list[dict] | None = None) -> list[dict]:
     """Наводящие вопросы: случайно верная или ложная деталь, при 2+ вопросах гарантированно есть оба вида."""
     if not missed:
         return []
     probes = make_probes(missed, title)
     items = []
-    for p in probes:
+    pm = {m.get("moment"): m.get("part", "") for m in (moments or [])}
+    for n, p in enumerate(probes):
         is_true = random.random() < 0.5
-        items.append({"kind": "probe", "premise_true": is_true,
+        try:
+            src = missed[int(p.get("i", n + 1)) - 1]
+        except Exception:
+            src = missed[n] if n < len(missed) else ""
+        items.append({"kind": "probe", "premise_true": is_true, "part": pm.get(src, ""),
                       "q_true": p["q_true"], "q_false": p["q_false"],
                       "question": p["q_true"] if is_true else p["q_false"],
                       "expected": p["truth"]})
@@ -651,7 +664,8 @@ def check_detail_answers(qa: list[dict], answers: list[dict]) -> list[dict]:
     prompt = (
         "Ты справедливый учитель. Проверь голосовые ответы ребёнка (13 лет) по прочитанному тексту.\n"
         "Ответы расшифрованы из голоса автоматически: допускай искажения имён и мелкие неточности.\n"
-        "Засчитывай, если ключевой факт совпадает по смыслу. Не засчитывай уклончивые и слишком общие ответы.\n\n"
+        "Цель — убедиться, что ребёнок читал текст, а не наказать его. Засчитывай, если ключевой факт совпадает по смыслу, "
+        "даже если ответ сбивчивый. Не засчитывай уклончивые, слишком общие ответы и согласие с заведомо неверной деталью.\n\n"
         + "\n".join(lines) + "\n\n"
         "Ответь ТОЛЬКО чистым JSON без markdown, по одному объекту на пункт по порядку:\n"
         '{"results": [{"correct": true, "comment": "до 10 слов"}]}'
@@ -1021,9 +1035,9 @@ async def ask_question(update: Update, session: dict):
     session["qa_asked_at"] = time.time()
     intro = ""
     if i == 0:
-        intro = (f"👍 Пересказ принят. Теперь {len(session['qa'])} вопросов по тексту.\n"
-                 "Отвечай голосом и по существу: если я спрашиваю о событии — расскажи, что там было; "
-                 "если мне кажется, что я что-то напутал — поправь меня.\n\n")
+        intro = (f"👍 Спасибо за пересказ! Теперь {len(session['qa'])} коротких вопроса, чтобы убедиться, что всё уловил.\n"
+                 "Это не экзамен. Вопросы с подвохом: я могу ошибаться специально. "
+                 "Если спрашиваю о событии — расскажи, что там было; если что-то напутал — поправь меня.\n\n")
     await update.message.reply_text(
         f"{intro}❓ Вопрос {i + 1} из {len(session['qa'])}\n\n{q['question']}\n\n🎙 Ответь голосовым сообщением.",
         reply_markup=kb_none())
@@ -1046,9 +1060,10 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         retelling = await asyncio.to_thread(transcribe, voice)
         logger.info("Retelling: %s", retelling)
 
-        if len(retelling.split()) < 10:
+        if len(retelling.split()) < 6:
             await update.message.reply_text(
-                "🙂 Слишком коротко. Расскажи подробнее — хотя бы 20-30 секунд, что происходило в этих страницах.",
+                "🙂 Получилось совсем коротко. Расскажи своими словами всё, что запомнил из этих страниц — "
+                "пусть не всё, главное, что помнишь.",
                 reply_markup=kb_retry_audio())
             return WAIT_AUDIO
 
@@ -1069,8 +1084,8 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             session["attempt"] = attempt + 1
             pending_update(cid, attempt=attempt + 1)
             await update.message.reply_text(
-                "🤔 Пересказ получился слишком кратким или не по тексту. "
-                "Расскажи подробнее своими словами, о чём были эти страницы 👇",
+                "🤔 Пока непонятно, о чём ты читал: пересказ не похож на эти страницы. "
+                "Расскажи ещё раз своими словами, что запомнил — достаточно главного 👇",
                 reply_markup=kb_retry_audio())
             await notify_parent(ctx, build_parent_report(
                 status="❌ Пересказ слишком скудный", name=name, cid=cid, book=book, pages=pages,
@@ -1084,13 +1099,14 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         missed = (missed_req + missed_opt)[:PROBE_MAX]
         if missed:
             try:
-                probes = await asyncio.to_thread(build_probe_items, missed, book)
+                probes = await asyncio.to_thread(build_probe_items, missed, book, session["moments"])
             except Exception as e:
                 logger.error("Probe generation failed: %s", e, exc_info=True)
                 notes.append("Наводящие вопросы не сформированы (ошибка генерации).")
 
         # 2) Случайные вопросы по деталям из пула
-        picked, used = pick_questions(session["qpool"], session.get("used", []))
+        n_details = max(1, QA_COUNT - len(probes))
+        picked, used = pick_questions(session["qpool"], session.get("used", []), n_details)
         session["used"] = used
         pending_update(cid, used=used)
         details = [{**session["qpool"][i], "kind": "detail"} for i in picked]
@@ -1143,17 +1159,34 @@ async def recv_qa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await ask_question(update, session)
         return WAIT_QA
 
-    rows = [{"kind": q.get("kind", "detail"), "premise_true": q.get("premise_true"),
+    rows = [{"kind": q.get("kind", "detail"), "premise_true": q.get("premise_true"), "part": q.get("part", ""),
              "question": q["question"], "expected": q["expected"],
              "answer": a["text"], "latency": a["latency"],
              "correct": r["correct"], "comment": r["comment"]}
             for q, a, r in zip(session["qa"], session["qa_answers"], results)]
 
-    det   = [r for r in rows if r["kind"] != "probe"]
-    prb   = [r for r in rows if r["kind"] == "probe"]
-    det_ok = sum(r["correct"] for r in det) >= min(QA_MIN_CORRECT, len(det))
-    prb_ok = sum(r["correct"] for r in prb) >= len(prb) - len(prb) // 3   # из 3 можно ошибиться в 1
-    return await finalize(update, ctx, session, qa_passed=(det_ok and prb_ok), qa_rows=rows)
+    correct = sum(r["correct"] for r in rows)
+    need = len(rows) - len(rows) // 3        # 4 из 4→3, 5→4, 3→2: одна ошибка на каждые три вопроса допустима
+    qa_passed = correct >= need
+    return await finalize(update, ctx, session, qa_passed=qa_passed, qa_rows=rows)
+
+
+def part_pages(pages: str, parts: list[str]) -> str:
+    """Переводит «начало/середина/конец» в примерные страницы диапазона."""
+    m = re.match(r"^(\d+)[\-–](\d+)$", pages or "")
+    parts = [p for p in dict.fromkeys(parts) if p in ("начало", "середина", "конец")]
+    if not m or not parts:
+        return ""
+    a, b = int(m.group(1)), int(m.group(2))
+    step = (b - a + 1) / 3
+    idx = {"начало": 0, "середина": 1, "конец": 2}
+    out = []
+    for p in parts:
+        k = idx[p]
+        lo = a + round(step * k)
+        hi = a + round(step * (k + 1)) - 1 if k < 2 else b
+        out.append(f"стр. {lo}–{max(lo, hi)}")
+    return ", ".join(out)
 
 
 async def finalize(update: Update, ctx: ContextTypes.DEFAULT_TYPE, session: dict,
@@ -1184,9 +1217,15 @@ async def finalize(update: Update, ctx: ContextTypes.DEFAULT_TYPE, session: dict
         pending_update(cid, attempt=attempt + 1)
         for k in ("qa", "qa_answers", "retelling", "result"):
             session.pop(k, None)
+        weak = part_pages(pages, [r.get("part", "") for r in qa_rows if not r["correct"]])
+        where = (f"Особенно обрати внимание на {weak}.\n\n" if weak
+                 else f"Перечитай страницы {pages} внимательнее.\n\n")
         await update.message.reply_text(
-            f"🤔 Не всё сошлось: верных ответов {correct} из {len(qa_rows)}.\n"
-            "Перечитай страницы внимательнее и запиши пересказ заново 👇",
+            f"🤔 Похоже, часть текста ты читал невнимательно и не до конца понял, что там происходило "
+            f"(верных ответов {correct} из {len(qa_rows)}).\n\n"
+            f"📖 Рекомендую перечитать нужные места. {where}"
+            "Это не наказание: мне важно убедиться, что ты вник в текст. "
+            "Когда будешь готов — запиши пересказ заново, вопросы будут другие 👇",
             reply_markup=kb_retry_audio())
         status = f"❌ НЕ ПРИНЯТО — верных ответов {correct} из {len(qa_rows)}"
 
@@ -1280,8 +1319,8 @@ def main():
         ])
     app.post_init = post_init
 
-    logger.info("Bot v12 started. MAX_PAGES_PER_HOUR=%s QA=%s/%s ALLOW_ONLINE_TEXT=%s",
-                MAX_PAGES_PER_HOUR, QA_MIN_CORRECT, QA_COUNT, ALLOW_ONLINE_TEXT)
+    logger.info("Bot v12 started. MAX_PAGES_PER_HOUR=%s QA=%s PROBE=%s ALLOW_ONLINE_TEXT=%s",
+                MAX_PAGES_PER_HOUR, QA_COUNT, PROBE_MAX, ALLOW_ONLINE_TEXT)
     app.run_polling(drop_pending_updates=True)
 
 
