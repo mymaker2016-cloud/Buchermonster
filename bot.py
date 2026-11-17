@@ -1319,7 +1319,10 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ══════════════════════════════════════════════════════════════════
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (Application.builder().token(TELEGRAM_TOKEN)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(30)
+           .build())
     text_only = filters.TEXT & ~filters.COMMAND
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1352,17 +1355,27 @@ def main():
     app.add_handler(CommandHandler("unlock", cmd_unlock))
 
     async def post_init(application):
-        await application.bot.set_my_commands([
-            BotCommand("start",   "▶️ Начать / сдать чтение"),
-            BotCommand("history", "📊 История чтения"),
-            BotCommand("cancel",  "❌ Отменить"),
-        ])
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("start",   "▶️ Начать / сдать чтение"),
+                BotCommand("history", "📊 История чтения"),
+                BotCommand("cancel",  "❌ Отменить"),
+            ])
+        except Exception as e:      # меню команд не критично: не падаем из-за сетевого сбоя
+            logger.warning("set_my_commands failed: %s", e)
     app.post_init = post_init
 
     logger.info("Bot v12 started. MAX_PAGES_PER_HOUR=%s QA=%s PROBE=%s ALLOW_ONLINE_TEXT=%s",
                 MAX_PAGES_PER_HOUR, QA_COUNT, PROBE_MAX, ALLOW_ONLINE_TEXT)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
-    main()
+    # Перезапуск при любом сбое (сеть Telegram, таймаут), чтобы бот не оставался «Crashed»
+    while True:
+        try:
+            main()
+            break
+        except Exception as e:
+            logger.error("Bot crashed: %s — restart in 10s", e, exc_info=True)
+            time.sleep(10)
