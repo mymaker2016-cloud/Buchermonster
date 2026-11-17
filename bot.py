@@ -357,6 +357,7 @@ def extract_key_moments(book_text: str, pages: str, title: str) -> list[dict]:
     m = re.search(r"\[.*\]", raw, re.DOTALL)
     try:
         return json.loads(m.group() if m else raw)
+
     except Exception:
         return []
 
@@ -405,11 +406,7 @@ def check_retelling_against_moments(key_moments: list[dict], retelling: str, pag
         '"summary": "для родителя — что упомянул, что пропустил (2-3 предл.)", '
         '"missed_required": ["..."], "missed_optional": ["..."]}'
     )
-    resp = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return _parse_json(resp.content[0].text)
+    return claude_json([{"role": "user", "content": prompt}], 1024)
 
 
 def check_by_text(book_text: str, retelling: str, pages: str, title: str) -> dict:
@@ -437,6 +434,22 @@ def _parse_json(raw: str) -> dict:
                 raw = part; break
     m = re.search(r'\{.*\}', raw, re.DOTALL)
     return json.loads(m.group() if m else raw)
+
+
+def claude_json(messages: list, max_tokens: int, tries: int = 3) -> dict:
+    """Вызов Claude с ответом в JSON: повторяет при пустом/не-JSON ответе и пишет сырой ответ в лог."""
+    last = ""
+    for k in range(tries):
+        resp = claude.messages.create(model="claude-opus-4-5", max_tokens=max_tokens, messages=messages)
+        text = "".join(getattr(b, "text", "") for b in resp.content)
+        last = text
+        try:
+            return _parse_json(text)
+        except Exception:
+            logger.error("Claude вернул не JSON (попытка %s/%s, stop=%s): %r",
+                         k + 1, tries, resp.stop_reason, text[:400])
+            time.sleep(1.5)
+    raise ValueError(f"Claude вернул не JSON: {last[:200]!r}")
 
 # ══════════════════════════════════════════════════════════════════
 #  ТАЙМЕР / PENDING (БД)
@@ -545,10 +558,7 @@ def analyze_pages(photos: list[str], book_text: str, pages: str, title: str) -> 
         ' "questions": [{"question": "...", "expected": "правильный ответ", "part": "начало"}]}'
     )
     content.append({"type": "text", "text": src + "\n\n" + rules})
-    resp = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=6000,
-        messages=[{"role": "user", "content": content}])
-    data = _parse_json(resp.content[0].text)
+    data = claude_json([{"role": "user", "content": content}], 6000)
 
     moments = [m for m in data.get("key_moments", []) if isinstance(m, dict) and m.get("moment")]
     qpool = [q for q in data.get("questions", [])
@@ -605,10 +615,7 @@ def make_probes(missed: list[str], title: str) -> list[dict]:
         "Ответь ТОЛЬКО чистым JSON без markdown, объекты по порядку событий:\n"
         '{"probes": [{"i": 1, "q_true": "...", "q_false": "...", "truth": "..."}]}'
     )
-    resp = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}])
-    data = _parse_json(resp.content[0].text)
+    data = claude_json([{"role": "user", "content": prompt}], 1500)
     return [p for p in data.get("probes", [])
             if isinstance(p, dict) and p.get("q_true") and p.get("q_false") and p.get("truth")]
 
@@ -670,10 +677,7 @@ def check_detail_answers(qa: list[dict], answers: list[dict]) -> list[dict]:
         "Ответь ТОЛЬКО чистым JSON без markdown, по одному объекту на пункт по порядку:\n"
         '{"results": [{"correct": true, "comment": "до 10 слов"}]}'
     )
-    resp = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=600,
-        messages=[{"role": "user", "content": prompt}])
-    data = _parse_json(resp.content[0].text)
+    data = claude_json([{"role": "user", "content": prompt}], 600)
     raw = data.get("results", [])
     out = []
     for i in range(len(qa)):
@@ -1123,6 +1127,7 @@ async def recv_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     except Exception as e:
         logger.error("Audio error: %s", e, exc_info=True)
+        await notify_parent(ctx, f"⚠️ Ошибка бота при проверке пересказа ({type(e).__name__}): {str(e)[:500]}")
         await update.message.reply_text("😔 Ошибка. Попробуй записать пересказ ещё раз.",
                                         reply_markup=kb_retry_audio())
         return WAIT_AUDIO
